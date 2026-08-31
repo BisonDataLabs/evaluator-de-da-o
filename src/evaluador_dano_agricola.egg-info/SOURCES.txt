@@ -1,0 +1,17 @@
+README.md
+pyproject.toml
+src/damage_assessor/__init__.py
+src/damage_assessor/catalog.py
+src/damage_assessor/demo.py
+src/damage_assessor/geometry.py
+src/damage_assessor/reporting.py
+src/damage_assessor/severity.py
+src/evaluador_dano_agricola.egg-info/PKG-INFO
+src/evaluador_dano_agricola.egg-info/SOURCES.txt
+src/evaluador_dano_agricola.egg-info/dependency_links.txt
+src/evaluador_dano_agricola.egg-info/requires.txt
+src/evaluador_dano_agricola.egg-info/top_level.txt
+tests/test_catalog.py
+tests/test_demo_package.py
+tests/test_geometry.py
+tests/test_severity.py

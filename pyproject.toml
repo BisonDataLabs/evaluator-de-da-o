@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "evaluador-dano-agricola"
+version = "0.1.0"
+description = "Aplicación Streamlit para evaluar perturbaciones agrícolas antes y después de un evento."
+requires-python = ">=3.11"
+dependencies = [
+  "streamlit>=1.40,<2",
+  "folium>=0.18,<1",
+  "streamlit-folium>=0.23,<1",
+  "pystac-client>=0.8,<1",
+  "requests>=2.32,<3",
+  "numpy>=1.26,<3",
+  "Pillow>=10,<13",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<10",
+  "ruff>=0.9,<1",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
