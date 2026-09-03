@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import html
 from typing import Any
 
 from branca.element import MacroElement, Template
@@ -612,5 +613,143 @@ def metric_change_map(
             "features": [enriched["features"][selected_row]],
         }
         focus_bbox = geojson_bbox(focus_geojson)
+    _ResponsiveFitBounds(_leaflet_bounds(padded_bbox(focus_bbox, 0.12))).add_to(map_view)
+    return map_view
+
+
+def _results_legend(map_view: Any, view_mode: str) -> None:
+    import folium
+
+    if view_mode == "Cambio intralote":
+        title = "Cambio intralote"
+        items = [
+            ("#CDD8E0", "Sin cambio destacado"),
+            ("#F9CF5C", "Cambio leve"),
+            ("#EF7E40", "Cambio moderado"),
+            ("#A6263A", "Cambio fuerte"),
+        ]
+    else:
+        title = "Resultado por lote"
+        items = [
+            ("#A6263A", "Cambio claro"),
+            ("#F9CF5C", "Indeterminado"),
+            ("#8FA5B2", "Sin cambio claro"),
+            ("#777777", "No evaluable"),
+        ]
+    rows = "".join(
+        '<div class="result-legend-row">'
+        f'<span style="background:{color}"></span>{html.escape(label)}</div>'
+        for color, label in items
+    )
+    content = f"""
+    <div class="result-legend"><b>{html.escape(title)}</b>{rows}</div>
+    <style>
+      .result-legend {{position:fixed;right:18px;bottom:28px;z-index:9999;background:white;
+        padding:12px 14px;border-radius:8px;box-shadow:0 2px 12px #0003;
+        font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}}
+      .result-legend-row {{margin:5px 0}}
+      .result-legend-row span {{display:inline-block;width:15px;height:15px;margin-right:7px;
+        vertical-align:-3px;border:1px solid #5555}}
+    </style>
+    """
+    map_view.get_root().html.add_child(folium.Element(content))
+
+
+def radar_results_map(
+    geojson: dict[str, Any],
+    lot_summaries: list[dict[str, Any]],
+    overlays: tuple[dict[str, Any], ...],
+    view_mode: str,
+    selected_row: int | None = None,
+) -> Any:
+    """Map the classified intralot raster or the robust decision for each lot."""
+    import folium
+
+    enriched = copy.deepcopy(geojson)
+    for index, feature in enumerate(enriched["features"]):
+        row = lot_summaries[index] if index < len(lot_summaries) else {}
+        properties = feature.setdefault("properties", {})
+        properties["_row_index"] = index
+        properties["resultado_satelital"] = row.get("resultado_satelital", "No evaluable")
+        properties["cambio_total_ha"] = row.get("cambio_total_ha", "")
+        properties["cambio_total_pct"] = row.get("cambio_total_pct", "")
+        properties["cambio_moderado_fuerte_pct"] = row.get(
+            "cambio_moderado_fuerte_pct", ""
+        )
+        properties["estado_calculo"] = row.get("estado", "No calculado")
+
+    min_x, min_y, max_x, max_y = geojson_bbox(enriched)
+    map_view = folium.Map(
+        location=[(min_y + max_y) / 2, (min_x + max_x) / 2],
+        tiles=None,
+        control_scale=True,
+        zoom_control=True,
+    )
+    _add_hybrid_base(map_view)
+
+    if view_mode == "Cambio intralote":
+        raster_group = folium.FeatureGroup(name="Cambio intralote", show=True)
+        for overlay in overlays:
+            folium.raster_layers.ImageOverlay(
+                image=_data_uri(overlay["image_png"]),
+                bounds=_leaflet_bounds(tuple(overlay["bbox"])),
+                name=str(overlay.get("pedido") or "Lote"),
+                opacity=1.0,
+                interactive=True,
+                cross_origin=False,
+                zindex=3,
+            ).add_to(raster_group)
+        raster_group.add_to(map_view)
+
+    def style(feature: dict[str, Any]) -> dict[str, Any]:
+        properties = feature.get("properties") or {}
+        selected = properties.get("_row_index") == selected_row
+        if view_mode == "Cambio intralote":
+            fill = "#FFFFFF"
+            fill_opacity = 0
+        else:
+            fill = {
+                "Cambio claro": "#A6263A",
+                "Indeterminado": "#F9CF5C",
+                "Sin cambio claro": "#8FA5B2",
+            }.get(str(properties.get("resultado_satelital")), "#777777")
+            fill_opacity = 0.52
+        return {
+            "color": "#00E5FF" if selected else "#FFFFFF",
+            "weight": 6 if selected else 3,
+            "fillColor": fill,
+            "fillOpacity": fill_opacity,
+        }
+
+    tooltip_candidates = [
+        ("pedido", "Lote"),
+        ("establecimiento", "Campo"),
+        ("resultado_satelital", "Resultado satelital"),
+        ("cambio_total_ha", "Cambio total (ha)"),
+        ("cambio_total_pct", "Cambio total (%)"),
+        ("cambio_moderado_fuerte_pct", "Moderado + fuerte (%)"),
+    ]
+    available = {
+        key for feature in enriched["features"] for key in (feature.get("properties") or {})
+    }
+    fields = [key for key, _ in tooltip_candidates if key in available]
+    aliases = [label for key, label in tooltip_candidates if key in available]
+    folium.GeoJson(
+        enriched,
+        name="Lotes y resultados",
+        style_function=style,
+        highlight_function=lambda _: {"color": "#41E5FF", "weight": 5},
+        tooltip=folium.GeoJsonTooltip(fields=fields, aliases=aliases),
+        zoom_on_click=True,
+    ).add_to(map_view)
+    _add_labels(map_view)
+    _results_legend(map_view, view_mode)
+    folium.LayerControl(collapsed=True).add_to(map_view)
+
+    focus_bbox = (min_x, min_y, max_x, max_y)
+    if selected_row is not None and 0 <= selected_row < len(enriched["features"]):
+        focus_bbox = geojson_bbox(
+            {"type": "FeatureCollection", "features": [enriched["features"][selected_row]]}
+        )
     _ResponsiveFitBounds(_leaflet_bounds(padded_bbox(focus_bbox, 0.12))).add_to(map_view)
     return map_view

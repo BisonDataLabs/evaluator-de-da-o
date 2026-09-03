@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import io
+import warnings
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+from PIL import Image
 
 from .catalog import SceneAcquisition, SceneCandidate
 from .geometry import feature_area_ha_approx, geojson_bbox
@@ -17,6 +20,41 @@ class SensorMetricResult:
     sensor: str
     summary: dict[str, Any]
     lot_summaries: list[dict[str, Any]]
+    overlays: tuple[dict[str, Any], ...] = ()
+
+
+RADAR_EVENT_CHANGE_THRESHOLD_DB = 2.5626
+RADAR_EVENT_POSTERIOR_THRESHOLD_DB = -18.3445
+RADAR_DECISION_LOW_DB = 2.1
+RADAR_DECISION_HIGH_DB = 3.1
+RADAR_PIXEL_THRESHOLDS_DB = (2.202, 2.916, 3.812)
+
+RADAR_CLASS_COLORS = {
+    0: (205, 216, 224, 105),
+    1: (249, 207, 92, 190),
+    2: (239, 126, 64, 210),
+    3: (166, 38, 58, 230),
+}
+
+_PATTERN_FEATURE_CENTER = np.asarray(
+    [0.501522, 3.211228, 0.793259, 3.523374, 0.234254, -16.822468, -12.757853],
+    dtype=np.float64,
+)
+_PATTERN_FEATURE_SCALE = np.asarray(
+    [1.108129, 1.146009, 0.802213, 0.685360, 0.942199, 1.479230, 2.643879],
+    dtype=np.float64,
+)
+_PATTERN_CENTERS = {
+    "Cambio amplio e intenso": np.asarray(
+        [2.083282, 2.266789, 1.619253, 2.061361, -1.062773, 0.235620, -0.056473]
+    ),
+    "Aumento con señal posterior alta": np.asarray(
+        [0.581326, 0.547297, -0.302746, -0.418039, -0.844212, 1.371475, 1.341632]
+    ),
+    "Cambio localizado o de menor amplitud": np.asarray(
+        [-0.234708, -0.167606, -0.014954, 0.112387, 0.330238, -0.556418, 0.055640]
+    ),
+}
 
 
 def _feature_collection(feature: dict[str, Any]) -> dict[str, Any]:
@@ -68,7 +106,75 @@ def _median_filter(array: np.ndarray, size: int = 3) -> np.ndarray:
     padding = size // 2
     padded = np.pad(array, padding, mode="edge")
     windows = np.lib.stride_tricks.sliding_window_view(padded, (size, size))
-    return np.nanmedian(windows, axis=(-2, -1)).astype(np.float32)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="All-NaN slice encountered")
+        return np.nanmedian(windows, axis=(-2, -1)).astype(np.float32)
+
+
+def _erode_mask(mask: np.ndarray) -> np.ndarray:
+    padded = np.pad(mask, 1, mode="constant", constant_values=False)
+    windows = np.lib.stride_tricks.sliding_window_view(padded, (3, 3))
+    return np.all(windows, axis=(-2, -1))
+
+
+def _remove_small_regions(
+    classes: np.ndarray,
+    valid: np.ndarray,
+    minimum_pixels: int = 4,
+) -> None:
+    active = valid & (classes > 0)
+    seen = np.zeros(active.shape, dtype=bool)
+    height, width = active.shape
+    for row, column in np.argwhere(active):
+        if seen[row, column]:
+            continue
+        stack = [(int(row), int(column))]
+        seen[row, column] = True
+        component: list[tuple[int, int]] = []
+        while stack:
+            current_row, current_column = stack.pop()
+            component.append((current_row, current_column))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    next_row = current_row + dy
+                    next_column = current_column + dx
+                    if not (0 <= next_row < height and 0 <= next_column < width):
+                        continue
+                    if active[next_row, next_column] and not seen[next_row, next_column]:
+                        seen[next_row, next_column] = True
+                        stack.append((next_row, next_column))
+        if len(component) < minimum_pixels:
+            for current_row, current_column in component:
+                classes[current_row, current_column] = 0
+
+
+def _class_png(classes: np.ndarray, valid: np.ndarray) -> bytes:
+    rgba = np.zeros((*classes.shape, 4), dtype=np.uint8)
+    for level, color in RADAR_CLASS_COLORS.items():
+        rgba[valid & (classes == level)] = color
+    output = io.BytesIO()
+    Image.fromarray(rgba, mode="RGBA").save(output, format="PNG", optimize=True)
+    return output.getvalue()
+
+
+def _radar_decision(delta_vh_p95_db: float) -> str:
+    if delta_vh_p95_db >= RADAR_DECISION_HIGH_DB:
+        return "Cambio claro"
+    if delta_vh_p95_db <= RADAR_DECISION_LOW_DB:
+        return "Sin cambio claro"
+    return "Indeterminado"
+
+
+def _radar_pattern(features: np.ndarray, event_detected: bool) -> str:
+    if not event_detected:
+        return "Sin patrón asignado"
+    standardized = (features - _PATTERN_FEATURE_CENTER) / _PATTERN_FEATURE_SCALE
+    return min(
+        _PATTERN_CENTERS,
+        key=lambda name: float(np.sum((standardized - _PATTERN_CENTERS[name]) ** 2)),
+    )
 
 
 def _identity(feature: dict[str, Any]) -> dict[str, Any]:
@@ -265,7 +371,7 @@ def calculate_radar_metrics(
     after: SceneAcquisition,
     geojson: dict[str, Any],
 ) -> SensorMetricResult:
-    """Calculate S1 change from linear-power RTC VV/VH on a common per-lot grid."""
+    """Calculate the calibrated S1 intralot change product on a common per-lot grid."""
     comparable = (
         before.relative_orbit is not None
         and before.relative_orbit == after.relative_orbit
@@ -286,7 +392,8 @@ def calculate_radar_metrics(
                 "area_referencia_ha": round(
                     sum(float(row["area_referencia_ha"]) for row in rows), 2
                 ),
-                "area_perturbada_ha_preliminar": 0.0,
+                "cambio_total_ha": 0.0,
+                "cambio_moderado_fuerte_ha": 0.0,
                 "lotes_calculados": 0,
                 "metodo": "Bloqueado por geometría de adquisición no comparable",
             },
@@ -315,6 +422,7 @@ def calculate_radar_metrics(
         bbox = geojson_bbox(_feature_collection(feature))
         width, height = native_grid_size(bbox, target_meters=10, max_dimension=768)
         mask = _mask_for_feature(feature, bbox, width, height)
+        interior = _erode_mask(mask)
 
         def read(scene: SceneCandidate, asset: str) -> np.ndarray:
             array = fetch_raw_array(
@@ -332,15 +440,15 @@ def calculate_radar_metrics(
         pre_vh = read(pre_scene, "vh")
         post_vv = read(post_scene, "vv")
         post_vh = read(post_scene, "vh")
-        valid = mask & np.isfinite(pre_vv) & np.isfinite(pre_vh)
+        valid = interior & np.isfinite(pre_vv) & np.isfinite(pre_vh)
         valid &= np.isfinite(post_vv) & np.isfinite(post_vh)
-        valid_pct = 100 * valid.sum() / max(mask.sum(), 1)
-        if valid_pct < 90:
+        valid_pct = 100 * valid.sum() / max(interior.sum(), 1)
+        if valid.sum() < 25 or valid_pct < 90:
             return {
                 **identity,
                 "pixeles_validos_pct": round(float(valid_pct), 1),
                 "estado": "No calculado",
-                "motivo": "La cobertura radar válida conjunta es menor a 90% del lote.",
+                "motivo": "La cobertura radar válida conjunta es menor a 90% del interior del lote.",
             }
 
         pre_vv_db = 10 * np.log10(np.maximum(pre_vv, 1e-8))
@@ -349,46 +457,106 @@ def calculate_radar_metrics(
         post_vh_db = 10 * np.log10(np.maximum(post_vh, 1e-8))
         delta_vv = post_vv_db - pre_vv_db
         delta_vh = post_vh_db - pre_vh_db
-        pre_rvi = 4 * pre_vh / np.maximum(pre_vv + pre_vh, 1e-8)
-        post_rvi = 4 * post_vh / np.maximum(post_vv + post_vh, 1e-8)
-        delta_rvi = post_rvi - pre_rvi
-        affected = valid & (np.abs(delta_vh) >= 2.0)
-        affected &= (np.abs(delta_vv) >= 1.5) | (np.abs(delta_rvi) >= 0.12)
-        affected_share = affected.sum() / max(valid.sum(), 1)
-        magnitude = (
-            np.nanmedian(
-                np.clip(np.abs(delta_vh[valid]) / 4.0, 0, 1)
-                + np.clip(np.abs(delta_vv[valid]) / 4.0, 0, 1)
-            )
-            / 2
+        delta_ratio = (post_vv_db - post_vh_db) - (pre_vv_db - pre_vh_db)
+
+        delta_vh_p95 = float(np.nanpercentile(delta_vh[valid], 95))
+        post_vh_median = float(np.nanmedian(post_vh_db[valid]))
+        event_detected = (
+            delta_vh_p95 > RADAR_EVENT_CHANGE_THRESHOLD_DB
+            and post_vh_median > RADAR_EVENT_POSTERIOR_THRESHOLD_DB
         )
-        score = round(10 * np.clip(0.55 * magnitude + 0.45 * affected_share, 0, 1), 1)
+
+        smooth_delta_vh = _median_filter(
+            np.where(valid, delta_vh, np.nan).astype(np.float32), 3
+        )
+        classes = np.zeros(valid.shape, dtype=np.uint8)
+        if event_detected:
+            classes[valid & (smooth_delta_vh > RADAR_PIXEL_THRESHOLDS_DB[0])] = 1
+            classes[valid & (smooth_delta_vh > RADAR_PIXEL_THRESHOLDS_DB[1])] = 2
+            classes[valid & (smooth_delta_vh > RADAR_PIXEL_THRESHOLDS_DB[2])] = 3
+            _remove_small_regions(classes, valid, minimum_pixels=4)
+
+        valid_count = max(int(valid.sum()), 1)
+        counts = {
+            level: int(np.sum(valid & (classes == level)))
+            for level in range(4)
+        }
+        shares = {level: counts[level] / valid_count for level in range(4)}
         area = float(identity["area_referencia_ha"])
-        return {
+        features = np.asarray(
+            [
+                float(np.nanmedian(delta_vh[valid])),
+                delta_vh_p95,
+                float(np.nanmedian(delta_vv[valid])),
+                float(np.nanpercentile(delta_vv[valid], 95)),
+                float(np.nanmedian(delta_ratio[valid])),
+                post_vh_median,
+                float(np.nanmedian(post_vv_db[valid])),
+            ]
+        )
+        row: dict[str, Any] = {
             **identity,
             "pixeles_validos_pct": round(float(valid_pct), 1),
-            "delta_vv_db_mediana": round(float(np.nanmedian(delta_vv[valid])), 2),
-            "delta_vh_db_mediana": round(float(np.nanmedian(delta_vh[valid])), 2),
-            "delta_rvi_mediana": round(float(np.nanmedian(delta_rvi[valid])), 3),
-            "area_perturbada_ha_preliminar": round(area * float(affected_share), 2),
-            "superficie_perturbada_pct": round(100 * float(affected_share), 1),
-            "severidad_satelital_0_10_preliminar": score,
-            "clase_preliminar": _severity_class(score),
+            "resultado_satelital": _radar_decision(delta_vh_p95),
+            "patron_respuesta_radar": _radar_pattern(features, event_detected),
+            "cambio_total_ha": round(area * sum(shares[level] for level in (1, 2, 3)), 2),
+            "cambio_total_pct": round(100 * sum(shares[level] for level in (1, 2, 3)), 1),
+            "cambio_moderado_fuerte_ha": round(area * (shares[2] + shares[3]), 2),
+            "cambio_moderado_fuerte_pct": round(100 * (shares[2] + shares[3]), 1),
             "estado": "Calculado",
             "motivo": "",
+            "_overlay_png": _class_png(classes, valid),
+            "_overlay_bbox": bbox,
+            "_class_data": np.where(valid, classes, 255).astype(np.uint8),
         }
+        for level in range(4):
+            row[f"clase_{level}_ha"] = round(area * shares[level], 2)
+            row[f"clase_{level}_pct"] = round(100 * shares[level], 1)
+        return row
 
-    rows = _run_by_feature(geojson, worker)
+    worker_rows = _run_by_feature(geojson, worker)
+    overlays = tuple(
+        {
+            "pedido": row.get("pedido", ""),
+            "bbox": row["_overlay_bbox"],
+            "image_png": row["_overlay_png"],
+            "class_data": row["_class_data"],
+        }
+        for row in worker_rows
+        if row.get("_overlay_png") is not None
+    )
+    rows = [
+        {key: value for key, value in row.items() if not key.startswith("_")}
+        for row in worker_rows
+    ]
     calculated = [row for row in rows if row.get("estado") == "Calculado"]
     total_area = sum(float(row.get("area_referencia_ha") or 0) for row in rows)
-    changed_area = sum(float(row.get("area_perturbada_ha_preliminar") or 0) for row in calculated)
+    changed_area = sum(float(row.get("cambio_total_ha") or 0) for row in calculated)
+    moderate_strong_area = sum(
+        float(row.get("cambio_moderado_fuerte_ha") or 0) for row in calculated
+    )
     return SensorMetricResult(
         sensor="Sentinel-1 RTC",
         summary={
             "area_referencia_ha": round(total_area, 2),
-            "area_perturbada_ha_preliminar": round(changed_area, 2),
+            "cambio_total_ha": round(changed_area, 2),
+            "cambio_moderado_fuerte_ha": round(moderate_strong_area, 2),
             "lotes_calculados": len(calculated),
-            "metodo": "Potencia lineal RTC; filtro mediana 3×3; cambios VV/VH/RVI",
+            "lotes_cambio_claro": sum(
+                row.get("resultado_satelital") == "Cambio claro" for row in calculated
+            ),
+            "lotes_indeterminados": sum(
+                row.get("resultado_satelital") == "Indeterminado" for row in calculated
+            ),
+            "lotes_sin_cambio_claro": sum(
+                row.get("resultado_satelital") == "Sin cambio claro" for row in calculated
+            ),
+            "lotes_no_evaluables": len(rows) - len(calculated),
+            "metodo": (
+                "Sentinel-1 RTC · cambio VH positivo · filtro mediana 3×3 · "
+                "calibración específica del evento"
+            ),
         },
         lot_summaries=rows,
+        overlays=overlays,
     )

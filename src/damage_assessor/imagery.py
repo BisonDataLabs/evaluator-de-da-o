@@ -35,8 +35,8 @@ RADAR_VISUAL_LAYERS: dict[str, dict[str, object]] = {
     "Sentinel-1 · RVI": {
         "assets": ("vv", "vh"),
         "expression": "4*vh/(vv+vh+0.0001)",
-        "rescale": "0,1",
-        "colormap_name": "turbo",
+        "rescale": "0,2.2",
+        "colormap_name": "rdylgn",
     },
 }
 

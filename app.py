@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import math
 import os
 import sys
+from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -12,6 +14,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
 import streamlit as st
+from PIL import Image
 
 from damage_assessor.acquisition_plan import next_sentinel1_pass
 from damage_assessor.catalog import (
@@ -47,14 +50,13 @@ from damage_assessor.imagery import (
     padded_bbox,
     resolve_tile_layer_url,
 )
-from damage_assessor.mapping import comparison_tile_swipe_map, metric_change_map, satellite_tile_map
+from damage_assessor.mapping import comparison_tile_swipe_map, radar_results_map, satellite_tile_map
 from damage_assessor.raw_analysis import (
     SensorMetricResult,
-    calculate_optical_metrics,
     calculate_radar_metrics,
 )
-from damage_assessor.reporting import build_analysis_package
-from damage_assessor.severity import severity_class, severity_scheme_rows
+from damage_assessor.reporting import build_download_package, build_results_workbook
+from damage_assessor.severity import severity_class
 from damage_assessor.weather import PowerDailySeries, fetch_power_daily
 
 st.set_page_config(
@@ -73,6 +75,109 @@ LAYER_ORDER = [
     "Sentinel-2 · NDMI",
 ]
 
+LAYER_GUIDANCE = {
+    RADAR_STANDARD_LAYER: """
+### Composición VV/VH
+
+- **Azul/cian:** respuesta baja; agua o superficies lisas.
+- **Verde:** respuesta intermedia, frecuente en vegetación y superficies rurales.
+- **Naranja:** respuesta VV elevada; superficie rugosa o húmeda.
+- **Amarillo:** respuesta muy alta en VV y VH; predominante en ciudades y construcciones.
+
+Aporta contexto visual. Ningún color debe leerse como daño.
+""",
+    "Sentinel-1 · VV alto contraste": """
+### VV alto contraste
+
+- **Negro:** respuesta VV muy baja; agua o superficies lisas.
+- **Gris:** respuesta frecuente en suelos y cultivos.
+- **Blanco:** respuesta VV elevada; superficies rugosas o húmedas, construcciones y montes.
+
+Un aumento de brillo posterior puede relacionarse con mayor humedad o rugosidad. Una reducción
+indica menor respuesta superficial.
+""",
+    "Sentinel-1 · VH alto contraste": """
+### VH alto contraste
+
+- **Negro:** escasa vegetación o poca estructura.
+- **Gris:** cobertura vegetal presente.
+- **Blanco:** estructuras densas.
+
+Una reducción de brillo posterior puede ser compatible con pérdida o aplanamiento de la estructura
+vegetal. Un aumento también puede responder a mayor humedad.
+""",
+    "Sentinel-1 · Cociente VV/VH": """
+### Cociente VV/VH
+
+- **Violeta/azul:** VH tiene mayor peso relativo; respuesta asociada con vegetación o estructuras
+  que dispersan la señal.
+- **Cian:** combinación de respuesta vegetal y superficial.
+- **Verde/amarillo:** VV predomina sobre VH; frecuente en suelo expuesto, superficies ordenadas y
+  construcciones.
+
+Un cambio de **azul/cian a verde/amarillo** indica una reducción relativa de VH y puede ser compatible
+con pérdida o aplanamiento de la estructura vegetal. El cambio inverso puede estar asociado con mayor
+humedad o mayor dispersión de la vegetación.
+
+Los puntos aislados corresponden principalmente al moteado propio del radar.
+""",
+    "Sentinel-1 · RVI": """
+### RVI
+
+- **Rojo:** vegetación ausente, escasa o con poca estructura.
+- **Amarillo:** cobertura y estructura vegetal intermedias.
+- **Verde:** vegetación con mayor cobertura y complejidad.
+
+Una disminución de verde hacia amarillo o rojo después del evento puede ser compatible con pérdida
+o aplanamiento del cultivo.
+
+La escena completa permanece visible como contexto. Esta interpretación corresponde únicamente al
+interior de los lotes.
+""",
+    OPTICAL_STANDARD_LAYER: """
+### RGB
+
+Representa una vista similar a la percepción humana.
+""",
+    "Sentinel-2 · NDVI": """
+### NDVI
+
+- **Rojo:** agua, sombra o ausencia de vegetación.
+- **Amarillo:** suelo, rastrojo o cobertura vegetal escasa.
+- **Verde claro:** vegetación presente.
+- **Verde oscuro:** vegetación densa y activa.
+
+Representa cobertura y actividad vegetal. Una disminución entre fechas puede indicar pérdida de
+cobertura o vigor.
+""",
+    "Sentinel-2 · NDRE": """
+### NDRE
+
+- **Rojo:** ausencia de vegetación o contenido muy bajo de clorofila.
+- **Amarillo:** cobertura escasa o baja actividad de clorofila.
+- **Verde claro:** cultivo con actividad intermedia.
+- **Verde oscuro:** dosel denso y mayor contenido de clorofila.
+
+Representa la actividad del dosel, especialmente en cultivos desarrollados. Una disminución puede
+indicar pérdida de estructura o clorofila.
+""",
+    "Sentinel-2 · NDMI": """
+### NDMI
+
+- **Rojo/naranja:** suelo, vegetación seca o bajo contenido de agua.
+- **Amarillo:** humedad vegetal reducida.
+- **Celeste:** vegetación con contenido de agua.
+- **Azul:** vegetación muy húmeda o agua superficial.
+
+Representa el contenido relativo de agua. La lluvia reciente puede modificar notablemente esta
+visualización.
+""",
+}
+
+FALLBACK_SEARCH_DAYS = 30
+MAX_CATALOG_ITEMS = 120
+RADAR_METRICS_VERSION = "s1-intralote-20260903-v1"
+
 
 @st.cache_data(show_spinner=False)
 def parse_geometry(payload: bytes) -> dict[str, Any]:
@@ -82,6 +187,52 @@ def parse_geometry(payload: bytes) -> dict[str, Any]:
 @st.cache_data(show_spinner=False, ttl=21_600)
 def planned_pass(geojson: dict[str, Any], event_date: date):
     return next_sentinel1_pass(geojson, event_date)
+
+
+@st.cache_data(show_spinner=False, ttl=21_600)
+def catalog_scenes(
+    geojson: dict[str, Any],
+    event_date: date,
+    days_before: int,
+    days_after: int,
+    collection: str,
+) -> list[Any]:
+    return search_scene_metadata(
+        geojson,
+        event_date,
+        days_before,
+        days_after,
+        collection,
+        max_items=MAX_CATALOG_ITEMS,
+    )
+
+
+def _search_with_explicit_fallback(
+    geojson: dict[str, Any],
+    event_date: date,
+    days_before: int,
+    days_after: int,
+    collection: str,
+    pair_selector: Callable[[list[Any]], ScenePair | None],
+) -> tuple[list[Any], int, int, bool]:
+    """Search the requested window and widen once only when a complete pair is absent."""
+    scenes = catalog_scenes(geojson, event_date, days_before, days_after, collection)
+    pair = pair_selector(scenes)
+    if pair is not None and pair.comparable:
+        return scenes, days_before, days_after, False
+
+    fallback_before = max(days_before, FALLBACK_SEARCH_DAYS)
+    fallback_after = max(days_after, FALLBACK_SEARCH_DAYS)
+    if (fallback_before, fallback_after) == (days_before, days_after):
+        return scenes, days_before, days_after, False
+    expanded = catalog_scenes(
+        geojson,
+        event_date,
+        fallback_before,
+        fallback_after,
+        collection,
+    )
+    return expanded, fallback_before, fallback_after, True
 
 
 @st.cache_data(show_spinner=False, ttl=21_600)
@@ -95,8 +246,40 @@ def power_weather(
 
 
 @st.cache_data(show_spinner=False, ttl=21_600)
+def radar_metrics(
+    before: SceneAcquisition,
+    after: SceneAcquisition,
+    geojson: dict[str, Any],
+    algorithm_version: str,
+) -> SensorMetricResult:
+    # The explicit version is part of Streamlit's cache key. Without it, a
+    # result produced by an earlier methodology can survive a code reload.
+    _ = algorithm_version
+    return calculate_radar_metrics(before, after, geojson)
+
+
+@st.cache_data(show_spinner=False, ttl=21_600)
 def rendered_scene(scene: Any, bbox: tuple[float, float, float, float]) -> bytes:
     return fetch_scene_image(scene, bbox)
+
+
+@st.cache_data(show_spinner=False, ttl=21_600)
+def rendered_acquisition_mosaic(
+    acquisition: SceneAcquisition,
+    bbox: tuple[float, float, float, float],
+) -> bytes:
+    """Render adjacent products on one transparent canvas for the download package."""
+    layers = [Image.open(io.BytesIO(rendered_scene(scene, bbox))).convert("RGBA") for scene in acquisition.scenes]
+    if not layers:
+        raise ValueError("La adquisición no contiene imágenes para exportar.")
+    canvas = Image.new("RGBA", layers[0].size, (0, 0, 0, 0))
+    for layer in layers:
+        if layer.size != canvas.size:
+            layer = layer.resize(canvas.size)
+        canvas.alpha_composite(layer)
+    output = io.BytesIO()
+    canvas.save(output, format="PNG", optimize=True)
+    return output.getvalue()
 
 
 @st.cache_data(show_spinner=False, ttl=21_600)
@@ -358,6 +541,53 @@ def _normalized_severity_rows(edited: Any) -> list[dict[str, Any]]:
     return normalized
 
 
+def _result_editor_rows(
+    lot_summaries: list[dict[str, Any]],
+    field_scores: dict[str, float | None],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in lot_summaries:
+        order = str(row.get("pedido", ""))
+        rows.append(
+            {
+                "ver_en_mapa": False,
+                "pedido": order,
+                "establecimiento": row.get("establecimiento", ""),
+                "area_referencia_ha": row.get("area_referencia_ha"),
+                "dano_observado_campo": field_scores.get(order),
+                "resultado_satelital": row.get("resultado_satelital", "No evaluable"),
+                "patron_respuesta_radar": row.get(
+                    "patron_respuesta_radar", "Sin patrón asignado"
+                ),
+                "cambio_total_ha": row.get("cambio_total_ha"),
+                "cambio_total_pct": row.get("cambio_total_pct"),
+                "cambio_moderado_fuerte_ha": row.get("cambio_moderado_fuerte_ha"),
+                "cambio_moderado_fuerte_pct": row.get("cambio_moderado_fuerte_pct"),
+                "clase_0_ha": row.get("clase_0_ha"),
+                "clase_0_pct": row.get("clase_0_pct"),
+                "clase_1_ha": row.get("clase_1_ha"),
+                "clase_1_pct": row.get("clase_1_pct"),
+                "clase_2_ha": row.get("clase_2_ha"),
+                "clase_2_pct": row.get("clase_2_pct"),
+                "clase_3_ha": row.get("clase_3_ha"),
+                "clase_3_pct": row.get("clase_3_pct"),
+                "motivo": row.get("motivo", ""),
+            }
+        )
+    return rows
+
+
+def _field_rows_from_scores(
+    observations: list[dict[str, Any]],
+    geojson: dict[str, Any],
+    field_scores: dict[str, float | None],
+) -> list[dict[str, Any]]:
+    rows = _severity_editor_rows(observations, geojson)
+    for row in rows:
+        row["escala_dano_0_10"] = field_scores.get(str(row.get("pedido", "")))
+    return _normalized_severity_rows(rows)
+
+
 def _analysis_key(
     payload: bytes,
     property_name: str,
@@ -583,6 +813,15 @@ truth_path = Path(
 )
 ground_truth = load_ground_truth(truth_path)
 active_truth = rows_for_geojson(ground_truth, active_geojson)
+uploaded_truth = rows_for_geojson(ground_truth, uploaded_geojson)
+upload_hash = hashlib.sha256(payload).hexdigest()[:16]
+field_score_key = f"field_scores_{upload_hash}"
+if field_score_key not in st.session_state:
+    st.session_state[field_score_key] = {
+        str(row.get("pedido", "")): float(row["escala_dano_0_10"])
+        for row in uploaded_truth
+        if row.get("escala_dano_0_10") not in (None, "")
+    }
 
 with st.sidebar:
     st.divider()
@@ -591,6 +830,7 @@ with st.sidebar:
 if run_search:
     state: dict[str, Any] = {
         "key": analysis_key,
+        "radar_metrics_version": RADAR_METRICS_VERSION,
         "images": {},
         "errors": {},
         "metrics": {},
@@ -598,25 +838,25 @@ if run_search:
     }
     with st.spinner("Consultando escenas en Planetary Computer…"):
         try:
-            # The sliders express the preferred proximity to the event. A wider
-            # The wider availability search keeps the nearest acquisition selectable.
-            search_days_before = max(days_before, 90)
-            search_days_after = max(days_after, 45)
-            radar = search_scene_metadata(
-                active_geojson,
-                event_date,
-                search_days_before,
-                search_days_after,
-                os.getenv("RADAR_COLLECTION", DEFAULT_RADAR_COLLECTION),
-                max_items=300,
+            radar, radar_search_before, radar_search_after, radar_expanded = (
+                _search_with_explicit_fallback(
+                    active_geojson,
+                    event_date,
+                    days_before,
+                    days_after,
+                    os.getenv("RADAR_COLLECTION", DEFAULT_RADAR_COLLECTION),
+                    lambda scenes: select_radar_pair(scenes, event_date),
+                )
             )
-            optical = search_scene_metadata(
-                active_geojson,
-                event_date,
-                search_days_before,
-                search_days_after,
-                os.getenv("OPTICAL_COLLECTION", DEFAULT_OPTICAL_COLLECTION),
-                max_items=300,
+            optical, optical_search_before, optical_search_after, optical_expanded = (
+                _search_with_explicit_fallback(
+                    active_geojson,
+                    event_date,
+                    days_before,
+                    days_after,
+                    os.getenv("OPTICAL_COLLECTION", DEFAULT_OPTICAL_COLLECTION),
+                    lambda scenes: select_optical_pair(scenes, event_date, max_cloud),
+                )
             )
             radar_pair = select_radar_pair(radar, event_date)
             optical_pair = select_optical_pair(optical, event_date, max_cloud)
@@ -630,8 +870,14 @@ if run_search:
                     "optical_pair": optical_pair,
                     "radar_acquisitions": radar_acquisitions,
                     "optical_acquisitions": optical_acquisitions,
-                    "search_days_before": search_days_before,
-                    "search_days_after": search_days_after,
+                    "search_windows": {
+                        "radar": (radar_search_before, radar_search_after),
+                        "optical": (optical_search_before, optical_search_after),
+                    },
+                    "expanded_search": {
+                        "radar": radar_expanded,
+                        "optical": optical_expanded,
+                    },
                 }
             )
             if radar_pair:
@@ -640,39 +886,88 @@ if run_search:
                 if radar_before and radar_after:
                     state["metric_pairs"]["radar"] = (radar_before, radar_after)
                     state["weather_radar_pair"] = (radar_before, radar_after)
-            if optical_pair:
-                optical_before = _acquisition_for_scene(optical_acquisitions, optical_pair.before)
-                optical_after = _acquisition_for_scene(optical_acquisitions, optical_pair.after)
-                if optical_before and optical_after:
-                    state["metric_pairs"]["optical"] = (optical_before, optical_after)
             bbox = geojson_bbox(active_geojson)
             state["render_bbox"] = padded_bbox(bbox)
         except Exception as exc:  # noqa: BLE001 - mensaje controlado en límite STAC
             state["fatal_error"] = str(exc)
 
-    with st.spinner("Consultando el plan oficial de próximas adquisiciones Sentinel-1…"):
-        try:
-            state["next_pass"] = planned_pass(active_geojson, event_date)
-        except Exception as exc:  # noqa: BLE001 - el plan no debe invalidar escenas disponibles
-            state["plan_error"] = str(exc)
+    radar_pair = state.get("radar_pair")
+    if not state.get("fatal_error") and (not radar_pair or not radar_pair.comparable):
+        with st.spinner("Consultando la próxima adquisición Sentinel-1…"):
+            try:
+                state["next_pass"] = planned_pass(active_geojson, event_date)
+            except Exception as exc:  # noqa: BLE001 - el plan no debe invalidar escenas disponibles
+                state["plan_error"] = str(exc)
+
+    if not state.get("fatal_error"):
+        radar_metric_pair = state.get("metric_pairs", {}).get("radar")
+        if radar_metric_pair:
+            with st.spinner("Procesando las métricas Sentinel-1 del par seleccionado…"):
+                try:
+                    state["metrics"]["radar"] = radar_metrics(
+                        radar_metric_pair[0],
+                        radar_metric_pair[1],
+                        active_geojson,
+                        RADAR_METRICS_VERSION,
+                    )
+                except Exception as exc:  # noqa: BLE001 - un sensor no invalida el otro
+                    state["errors"]["Métricas Sentinel-1"] = str(exc)
+
+            with st.spinner("Preparando las imágenes Sentinel-1 para descarga…"):
+                try:
+                    export_bbox = geojson_bbox(active_geojson)
+                    state["export_image_bbox"] = padded_bbox(export_bbox)
+                    state["export_images"] = {
+                        "sentinel1_anterior.png": rendered_acquisition_mosaic(
+                            radar_metric_pair[0], export_bbox
+                        ),
+                        "sentinel1_posterior.png": rendered_acquisition_mosaic(
+                            radar_metric_pair[1], export_bbox
+                        ),
+                    }
+                except Exception as exc:  # noqa: BLE001 - no invalida los datos calculados
+                    state["errors"]["Imágenes de descarga"] = str(exc)
+
+        with st.spinner("Consultando el contexto meteorológico de NASA POWER…"):
+            try:
+                radar_weather_pair = state.get("weather_radar_pair")
+                reference_dates = [event_date]
+                if radar_weather_pair:
+                    reference_dates.extend(
+                        [
+                            radar_weather_pair[0].acquired_date,
+                            radar_weather_pair[1].acquired_date,
+                        ]
+                    )
+                weather_start = min(reference_dates) - timedelta(days=8)
+                weather_end = max(reference_dates) + timedelta(days=1)
+                min_x, min_y, max_x, max_y = geojson_bbox(active_geojson)
+                state["weather"] = power_weather(
+                    (min_y + max_y) / 2,
+                    (min_x + max_x) / 2,
+                    weather_start,
+                    weather_end,
+                )
+            except Exception as exc:  # noqa: BLE001 - clima no invalida el análisis
+                state["weather_error"] = str(exc)
     st.session_state["real_analysis"] = state
 
 state = st.session_state.get("real_analysis")
 if state and state.get("key") != analysis_key:
     state = None
 
-overview_tab, scenes_tab, compare_tab, weather_tab, metrics_tab, field_tab, export_tab = st.tabs(
+compare_tab, metrics_tab, weather_tab, export_tab, overview_tab, scenes_tab = st.tabs(
     [
+        "Comparador",
+        "Métricas",
+        "Contexto climático",
+        "Descarga",
         "Resumen",
         "Escenas",
-        "Comparador",
-        "Contexto climático",
-        "Métricas",
-        "Severidad de campo",
-        "Descarga",
     ],
+    default="Comparador",
     key="main_navigation",
-    on_change="rerun",
+    on_change="ignore",
 )
 
 with overview_tab:
@@ -793,7 +1088,16 @@ with scenes_tab:
             hide_index=True,
         )
 
-with compare_tab:
+@st.fragment
+def render_comparator(
+    state: dict[str, Any] | None,
+    active_geojson: dict[str, Any],
+    event_date: date,
+    days_before: int,
+    days_after: int,
+    max_cloud: int,
+    analysis_key: str,
+) -> None:
     st.subheader("Comparación antes / después")
     if not state:
         st.info("El comparador aparecerá después de la consulta de escenas.")
@@ -854,7 +1158,6 @@ with compare_tab:
             key=f"comparison_pair_mode_{'radar' if is_radar else 'optical'}_{analysis_key}",
             width="stretch",
         )
-        state["metric_pairs"].pop("radar" if is_radar else "optical", None)
         before_acquisition: SceneAcquisition | None = None
         after_acquisition: SceneAcquisition | None = None
         left_date_label = "Anterior"
@@ -902,21 +1205,19 @@ with compare_tab:
             left_date_label = "Anterior"
             right_date_label = "Posterior"
         else:
-            date_scope = st.segmented_control(
-                "Fechas visibles",
-                ["Ventana elegida", "Todas las fechas encontradas"],
-                default=(
-                    "Ventana elegida" if has_pair_in_window else "Todas las fechas encontradas"
-                ),
-                key=f"comparison_date_scope_{'radar' if is_radar else 'optical'}_{analysis_key}",
-                width="stretch",
+            before_acquisitions = all_before_acquisitions
+            after_acquisitions = all_after_acquisitions
+            sensor_key = "radar" if is_radar else "optical"
+            search_before, search_after = state.get("search_windows", {}).get(
+                sensor_key,
+                (days_before, days_after),
             )
-            if date_scope == "Ventana elegida":
-                before_acquisitions = preferred_before_acquisitions
-                after_acquisitions = preferred_after_acquisitions
-            else:
-                before_acquisitions = all_before_acquisitions
-                after_acquisitions = all_after_acquisitions
+            if state.get("expanded_search", {}).get(sensor_key):
+                st.caption(
+                    f"Período consultado: {search_before} días anteriores y "
+                    f"{search_after} posteriores. La ventana se amplió porque faltaba una fecha "
+                    "para completar el par."
+                )
             if not has_pair_in_window:
                 st.info(
                     "No hay un par completo dentro de la ventana elegida. Las fechas cercanas "
@@ -971,13 +1272,6 @@ with compare_tab:
                 for acquisition in (before_acquisition, after_acquisition)
                 if acquisition is not None
             ]
-            if is_radar and before_acquisition is not None and after_acquisition is not None:
-                state["weather_radar_pair"] = tuple(
-                    sorted(
-                        (before_acquisition, after_acquisition),
-                        key=lambda acquisition: acquisition.acquired_at,
-                    )
-                )
             incomplete_coverage = [
                 (
                     acquisition,
@@ -1016,15 +1310,6 @@ with compare_tab:
                             "Estas pasadas radar no comparten órbita relativa y dirección; la vista "
                             "queda disponible, pero el cálculo cuantitativo permanece bloqueado."
                         )
-                    else:
-                        metric_before, metric_after = sorted(
-                            (before_acquisition, after_acquisition),
-                            key=lambda acquisition: acquisition.acquired_at,
-                        )
-                        state["metric_pairs"]["radar" if is_radar else "optical"] = (
-                            metric_before,
-                            metric_after,
-                        )
                     before_sources = _tile_sources(before_acquisition, layer)
                     after_sources = _tile_sources(after_acquisition, layer)
                     left, right = st.columns(2)
@@ -1056,16 +1341,23 @@ with compare_tab:
                         side_label,
                     )
                 st.iframe(map_view.get_root().render(), width="stretch", height=620)
-                if layer.endswith("NDVI"):
-                    st.caption("NDVI · rojo: menor vigor · verde: mayor vigor")
-                elif layer.endswith("NDRE"):
-                    st.caption("NDRE · sensibilidad al dosel y a la clorofila")
-                elif layer.endswith("NDMI"):
-                    st.caption("NDMI · respuesta asociada al contenido de humedad")
-                elif layer.endswith("RVI"):
-                    st.caption("RVI · contraste de estructura y dispersión de la vegetación")
+                guidance = LAYER_GUIDANCE.get(layer)
+                if guidance:
+                    st.markdown(guidance)
             except Exception as exc:  # noqa: BLE001 - render elegido aislado
                 st.error(f"No se pudo preparar la visualización elegida: {exc}")
+
+
+with compare_tab:
+    render_comparator(
+        state,
+        active_geojson,
+        event_date,
+        days_before,
+        days_after,
+        max_cloud,
+        analysis_key,
+    )
 
 
 with weather_tab:
@@ -1076,28 +1368,8 @@ with weather_tab:
         st.info("El contexto climático queda asociado a una selección satelital válida.")
     else:
         radar_weather_pair = state.get("weather_radar_pair")
-        reference_dates = [event_date]
-        if radar_weather_pair:
-            reference_dates.extend(
-                [
-                    radar_weather_pair[0].acquired_date,
-                    radar_weather_pair[1].acquired_date,
-                ]
-            )
-        weather_start = min(reference_dates) - timedelta(days=8)
-        weather_end = max(reference_dates) + timedelta(days=1)
-        min_x, min_y, max_x, max_y = geojson_bbox(active_geojson)
-        weather_longitude = (min_x + max_x) / 2
-        weather_latitude = (min_y + max_y) / 2
-
         try:
-            with st.spinner("Consultando el contexto meteorológico de NASA POWER…"):
-                weather = power_weather(
-                    weather_latitude,
-                    weather_longitude,
-                    weather_start,
-                    weather_end,
-                )
+            weather = state["weather"]
 
             chart_rows = [
                 {
@@ -1216,200 +1488,279 @@ with weather_tab:
                 "variaciones dentro de cada lote. La humedad se expresa entre 0 (seco) y 1 (saturado)."
             )
         except Exception as exc:  # noqa: BLE001 - servicio externo aislado del análisis
-            st.warning(f"El contexto de NASA POWER no está disponible en este momento: {exc}")
+            message = state.get("weather_error", str(exc))
+            st.warning(f"El contexto de NASA POWER no está disponible en este momento: {message}")
 
 
-with metrics_tab:
-    st.subheader("Métricas calculadas")
+@st.fragment
+def render_metrics(
+    state: dict[str, Any] | None,
+    active_geojson: dict[str, Any],
+    analysis_key: str,
+    field_score_key: str,
+) -> None:
+    st.subheader("Resultados Sentinel-1")
     if not state:
-        st.info("Las métricas quedan disponibles después de la búsqueda de adquisiciones.")
-    else:
-        metric_actions = st.columns(2)
-        radar_metric_pair = state.get("metric_pairs", {}).get("radar")
-        optical_metric_pair = state.get("metric_pairs", {}).get("optical")
-        if metric_actions[0].button(
-            "Calcular Sentinel-1 RTC",
-            width="stretch",
-            disabled=radar_metric_pair is None,
-            key=f"calculate_radar_{analysis_key}",
-        ):
-            with st.spinner("Calculando VV, VH y RVI desde potencia lineal RTC por lote…"):
-                try:
-                    state["metrics"]["radar"] = calculate_radar_metrics(
-                        radar_metric_pair[0], radar_metric_pair[1], active_geojson
-                    )
-                except Exception as exc:  # noqa: BLE001 - error analítico controlado
-                    state["errors"]["Métricas Sentinel-1"] = str(exc)
-        if metric_actions[1].button(
-            "Calcular Sentinel-2 L2A",
-            width="stretch",
-            disabled=optical_metric_pair is None,
-            key=f"calculate_optical_{analysis_key}",
-        ):
-            with st.spinner("Calculando índices y nubosidad SCL dentro de cada lote…"):
-                try:
-                    state["metrics"]["optical"] = calculate_optical_metrics(
-                        optical_metric_pair[0],
-                        optical_metric_pair[1],
-                        active_geojson,
-                        cloud_limit_pct=10,
-                    )
-                except Exception as exc:  # noqa: BLE001 - error analítico controlado
-                    state["errors"]["Métricas Sentinel-2"] = str(exc)
+        st.info("Los resultados quedan disponibles después de la búsqueda de adquisiciones.")
+        return
 
-        available_metrics = list(state.get("metrics", {}))
-        if not available_metrics:
-            st.info(
-                "Sentinel-1 utiliza potencia lineal RTC y un par de la misma órbita. Sentinel-2 "
-                "utiliza bandas L2A y bloquea cada lote con más de 10% de nube o sombra interna."
-            )
-        else:
-            metric_sensor = st.segmented_control(
-                "Resultado",
-                available_metrics,
-                default=available_metrics[0],
-                format_func=lambda value: (
-                    "Sentinel-1 radar" if value == "radar" else "Sentinel-2 óptico"
-                ),
-                key=f"metric_sensor_{analysis_key}",
-            )
-            result: SensorMetricResult = state["metrics"][metric_sensor]
-            summary = result.summary
-            total_area = float(summary.get("area_referencia_ha") or 0)
-            affected_area = float(summary.get("area_perturbada_ha_preliminar") or 0)
-            affected_pct = 100 * affected_area / total_area if total_area else 0
-            columns = st.columns(4)
-            columns[0].metric("Área de referencia", f"{total_area:,.1f} ha")
-            columns[1].metric("Perturbación preliminar", f"{affected_area:,.1f} ha")
-            columns[2].metric("Superficie perturbada", f"{affected_pct:,.1f}%")
-            columns[3].metric("Lotes calculados", int(summary.get("lotes_calculados") or 0))
-            table_event = st.dataframe(
-                result.lot_summaries,
-                width="stretch",
-                hide_index=True,
-                on_select="rerun",
-                selection_mode="single-row",
-                key=f"metric_table_{metric_sensor}_{analysis_key}",
-            )
-            selected_rows = table_event.selection.rows
-            selected_row = selected_rows[0] if selected_rows else None
-            metric_map = metric_change_map(
-                None,
-                active_geojson,
-                None,
-                result.lot_summaries,
-                selected_row,
-                sensor_label=result.sensor,
-            )
-            st.iframe(metric_map.get_root().render(), width="stretch", height=620)
-            st.caption(str(summary.get("metodo", "")))
-        for sensor_name, message in state.get("errors", {}).items():
-            if sensor_name.startswith("Métricas"):
-                st.warning(f"{sensor_name}: {message}")
+    result: SensorMetricResult | None = state.get("metrics", {}).get("radar")
+    if result is None:
+        st.info(
+            "No hubo un par Sentinel-1 compatible para realizar el cálculo. Las adquisiciones "
+            "deben compartir órbita relativa y dirección."
+        )
+        message = state.get("errors", {}).get("Métricas Sentinel-1")
+        if message:
+            st.warning(message)
+        return
 
-edited_truth = active_truth
+    if state.get("radar_metrics_version") != RADAR_METRICS_VERSION:
+        st.info(
+            "Las escenas corresponden a una búsqueda anterior a la clasificación intralote "
+            "actual. Una nueva búsqueda procesa esas adquisiciones con la metodología vigente."
+        )
+        return
 
-with field_tab:
-    st.subheader("Ground truth de severidad")
-    editable_rows = _severity_editor_rows(active_truth, active_geojson)
+    calculated_rows = [
+        row for row in result.lot_summaries if row.get("estado") == "Calculado"
+    ]
+    if not calculated_rows:
+        reasons = sorted(
+            {
+                str(row.get("motivo", "")).strip()
+                for row in result.lot_summaries
+                if str(row.get("motivo", "")).strip()
+            }
+        )
+        detail = reasons[0] if len(reasons) == 1 else " · ".join(reasons[:3])
+        st.warning(
+            "Las escenas fueron encontradas, pero no fue posible calcular los lotes."
+            + (f" Motivo: {detail}" if detail else "")
+        )
+
+    view_mode = st.segmented_control(
+        "Vista del mapa",
+        ["Cambio intralote", "Resultado por lote"],
+        default="Cambio intralote",
+        key=f"metric_view_{analysis_key}",
+    )
+    summary = result.summary
+    total_area = float(summary.get("area_referencia_ha") or 0)
+    changed_area = float(summary.get("cambio_total_ha") or 0)
+    moderate_strong_area = float(summary.get("cambio_moderado_fuerte_ha") or 0)
+    changed_pct = 100 * changed_area / total_area if total_area else 0
+    summary_columns = st.columns(6)
+    summary_columns[0].metric("Superficie analizada", f"{total_area:,.1f} ha")
+    summary_columns[1].metric("Superficie con cambio", f"{changed_area:,.1f} ha")
+    summary_columns[2].metric("Cambio sobre el total", f"{changed_pct:,.1f}%")
+    summary_columns[3].metric("Moderado + fuerte", f"{moderate_strong_area:,.1f} ha")
+    summary_columns[4].metric(
+        "Cambio claro", int(summary.get("lotes_cambio_claro") or 0)
+    )
+    summary_columns[5].metric(
+        "Indeterminados", int(summary.get("lotes_indeterminados") or 0)
+    )
+
+    editor_key = f"metric_editor_{analysis_key}"
+    editor_rows = _result_editor_rows(
+        result.lot_summaries,
+        st.session_state[field_score_key],
+    )
+    column_order = [
+        "ver_en_mapa",
+        "pedido",
+        "establecimiento",
+        "area_referencia_ha",
+        "dano_observado_campo",
+        "resultado_satelital",
+        "patron_respuesta_radar",
+        "cambio_total_ha",
+        "cambio_total_pct",
+        "cambio_moderado_fuerte_ha",
+        "cambio_moderado_fuerte_pct",
+        "clase_0_ha",
+        "clase_0_pct",
+        "clase_1_ha",
+        "clase_1_pct",
+        "clase_2_ha",
+        "clase_2_pct",
+        "clase_3_ha",
+        "clase_3_pct",
+        "motivo",
+    ]
     edited_table = st.data_editor(
-        editable_rows,
+        editor_rows,
         width="stretch",
+        height=430,
         hide_index=True,
         num_rows="fixed",
-        column_order=[
-            "pedido",
-            "establecimiento",
-            "cultivo",
-            "superficie_sembrada_ha",
-            "ha_dano",
-            "escala_dano_0_10",
-        ],
+        column_order=column_order,
         disabled=[
-            "pedido",
-            "establecimiento",
-            "cultivo",
-            "superficie_sembrada_ha",
-            "ha_dano",
+            column
+            for column in column_order
+            if column not in {"ver_en_mapa", "dano_observado_campo"}
         ],
         column_config={
+            "ver_en_mapa": st.column_config.CheckboxColumn("Ver", width="small"),
             "pedido": "Lote",
             "establecimiento": "Campo",
-            "cultivo": "Cultivo",
-            "superficie_sembrada_ha": st.column_config.NumberColumn(
-                "Superficie sembrada (ha)", format="%.2f"
+            "area_referencia_ha": st.column_config.NumberColumn(
+                "Superficie analizada (ha)", format="%.2f"
             ),
-            "ha_dano": st.column_config.NumberColumn("Área dañada (ha)", format="%.2f"),
-            "escala_dano_0_10": st.column_config.NumberColumn(
-                "Escala de daño 0–10",
+            "dano_observado_campo": st.column_config.NumberColumn(
+                "Daño observado en campo (0–10)",
                 min_value=0.0,
                 max_value=10.0,
                 step=0.5,
                 format="%.1f",
             ),
+            "resultado_satelital": "Resultado satelital",
+            "patron_respuesta_radar": "Patrón de respuesta radar",
+            "cambio_total_ha": st.column_config.NumberColumn(
+                "Cambio total (ha)", format="%.2f"
+            ),
+            "cambio_total_pct": st.column_config.NumberColumn(
+                "Cambio total (%)", format="%.1f"
+            ),
+            "cambio_moderado_fuerte_ha": st.column_config.NumberColumn(
+                "Moderado + fuerte (ha)", format="%.2f"
+            ),
+            "cambio_moderado_fuerte_pct": st.column_config.NumberColumn(
+                "Moderado + fuerte (%)", format="%.1f"
+            ),
+            "clase_0_ha": st.column_config.NumberColumn(
+                "Sin cambio destacado (ha)", format="%.2f"
+            ),
+            "clase_0_pct": st.column_config.NumberColumn(
+                "Sin cambio destacado (%)", format="%.1f"
+            ),
+            "clase_1_ha": st.column_config.NumberColumn("Cambio leve (ha)", format="%.2f"),
+            "clase_1_pct": st.column_config.NumberColumn("Cambio leve (%)", format="%.1f"),
+            "clase_2_ha": st.column_config.NumberColumn(
+                "Cambio moderado (ha)", format="%.2f"
+            ),
+            "clase_2_pct": st.column_config.NumberColumn(
+                "Cambio moderado (%)", format="%.1f"
+            ),
+            "clase_3_ha": st.column_config.NumberColumn("Cambio fuerte (ha)", format="%.2f"),
+            "clase_3_pct": st.column_config.NumberColumn("Cambio fuerte (%)", format="%.1f"),
+            "motivo": "Estado del cálculo",
         },
-        key=(
-            f"severity_editor_{hashlib.sha256(payload).hexdigest()[:12]}_"
-            f"{selection_property}_{selected_value}"
-        ),
+        key=editor_key,
     )
-    edited_truth = _normalized_severity_rows(edited_table)
-    scored_rows = [row for row in edited_truth if row["escala_dano_0_10"] != ""]
-    truth_metrics = st.columns(3)
-    truth_metrics[0].metric("Etiquetas originales disponibles", len(ground_truth))
-    truth_metrics[1].metric("Lotes con escala en la selección", len(scored_rows))
-    if scored_rows:
-        mean_score = sum(float(row["escala_dano_0_10"]) for row in scored_rows) / len(scored_rows)
-        truth_metrics[2].metric("Severidad observada media", f"{mean_score:.1f} / 10")
-    else:
-        truth_metrics[2].metric("Severidad observada media", "Sin datos")
-    st.caption(
-        "La escala de daño admite edición manual entre 0 y 10. Los cambios permanecen en la sesión "
-        "actual y forman parte del paquete descargable."
-    )
-    st.dataframe(severity_scheme_rows(), width="stretch", hide_index=True)
-    radar_ready = bool(state and state.get("radar_pair") and state["radar_pair"].comparable)
-    if radar_ready:
-        st.warning(
-            "Las etiquetas funcionan como target de calibración. La publicación de severidad satelital "
-            "requiere features homogéneas y validación por evento."
-        )
-    else:
-        st.info(
-            "Las etiquetas quedan disponibles como target. El ajuste satelital requiere un par "
-            "Sentinel-1 posterior comparable."
-        )
 
-with export_tab:
-    st.subheader("Paquete descargable")
-    if not state or not state.get("images"):
-        st.info("La descarga se habilita cuando hay imágenes disponibles.")
-    else:
-        export_layer = st.selectbox(
-            "Sensor a exportar",
-            _ordered_layer_names(state["images"]),
-            key="export_layer",
-        )
-        before_png, after_png, pair = state["images"][export_layer]
-        result = state.get("radar_change") if export_layer.startswith("Sentinel-1") else None
-        package = build_analysis_package(
+    edited_rows = (
+        edited_table.to_dict("records")
+        if hasattr(edited_table, "to_dict")
+        else list(edited_table)
+    )
+    field_scores = dict(st.session_state[field_score_key])
+    for row in edited_rows:
+        order = str(row.get("pedido", ""))
+        value = row.get("dano_observado_campo")
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            field_scores.pop(order, None)
+        else:
+            field_scores[order] = float(value)
+    score_state = st.session_state[field_score_key]
+    score_state.clear()
+    score_state.update(field_scores)
+
+    checked_rows = [
+        index for index, row in enumerate(edited_rows) if bool(row.get("ver_en_mapa"))
+    ]
+    selected_row = checked_rows[-1] if checked_rows else None
+    metric_map = radar_results_map(
+        active_geojson,
+        result.lot_summaries,
+        getattr(result, "overlays", ()),
+        view_mode or "Cambio intralote",
+        selected_row,
+    )
+    st.iframe(metric_map.get_root().render(), width="stretch", height=640)
+    st.caption(
+        "La clasificación representa cambios de la señal Sentinel-1 dentro de los lotes. "
+        "La evaluación de campo permanece editable y no modifica automáticamente el cálculo "
+        "satelital de la sesión."
+    )
+
+with metrics_tab:
+    render_metrics(state, active_geojson, analysis_key, field_score_key)
+
+@st.fragment
+def render_downloads(
+    state: dict[str, Any] | None,
+    active_geojson: dict[str, Any],
+    active_truth: list[dict[str, Any]],
+    field_score_key: str,
+    event_date: date,
+    selected_value: str,
+) -> None:
+    st.subheader("Descargas")
+    if not state:
+        st.info("Los archivos quedan disponibles después de la búsqueda de adquisiciones.")
+        return
+    result: SensorMetricResult | None = state.get("metrics", {}).get("radar")
+    radar_pair = state.get("metric_pairs", {}).get("radar")
+    if result is None or radar_pair is None:
+        st.info("No hay resultados Sentinel-1 disponibles para preparar los archivos.")
+        return
+
+    before, after = radar_pair
+    score_state = st.session_state[field_score_key]
+
+    def observations() -> list[dict[str, Any]]:
+        return _field_rows_from_scores(active_truth, active_geojson, score_state)
+
+    safe_selection = selected_value.replace(" ", "_")
+    st.download_button(
+        "Descargar tabla de resultados (.xlsx)",
+        data=lambda: build_results_workbook(result, observations(), before, after),
+        file_name=f"resultados_{safe_selection}_{event_date.isoformat()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+        on_click="ignore",
+        width="stretch",
+    )
+
+    export_images = state.get("export_images", {})
+    st.download_button(
+        "Descargar paquete completo (.zip)",
+        data=lambda: build_download_package(
             active_geojson,
             event_date,
-            export_layer,
-            pair,
-            before_png,
-            after_png,
             result,
-            edited_truth,
+            observations(),
+            before,
+            after,
+            state.get("weather"),
+            export_images,
+            state.get("export_image_bbox"),
+        ),
+        file_name=f"analisis_{safe_selection}_{event_date.isoformat()}.zip",
+        mime="application/zip",
+        on_click="ignore",
+        width="stretch",
+    )
+    st.caption(
+        "El paquete contiene la tabla, los lotes con resultados, la clasificación intralote "
+        "georreferenciada, las zonas de cambio, el contexto climático, los metadatos y las "
+        "imágenes Sentinel-1 anterior y posterior."
+    )
+    if not export_images:
+        st.warning(
+            "Esta sesión se procesó antes de habilitar la exportación de imágenes. Los demás "
+            "archivos permanecen disponibles; una nueva búsqueda incorpora las imágenes al ZIP."
         )
-        st.download_button(
-            "Descargar análisis (.zip)",
-            data=package,
-            file_name=f"granizo_{selected_value}_{event_date.isoformat()}.zip".replace(" ", "_"),
-            mime="application/zip",
-            type="primary",
-        )
-        st.caption(
-            "Incluye escenas, metadatos, selección GeoJSON, observaciones de campo y métricas "
-            "claramente marcadas como preliminares/no validadas."
-        )
+
+
+with export_tab:
+    render_downloads(
+        state,
+        active_geojson,
+        active_truth,
+        field_score_key,
+        event_date,
+        selected_value,
+    )
