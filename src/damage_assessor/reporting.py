@@ -63,6 +63,13 @@ def _field_scores(field_observations: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _is_blank_cell(value: Any) -> bool:
+    """Treat empty editable cells as blank spreadsheet cells."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return True
+    return isinstance(value, (float, np.floating)) and math.isnan(float(value))
+
+
 def result_table_rows(
     result: SensorMetricResult,
     field_observations: list[dict[str, Any]],
@@ -138,7 +145,7 @@ def build_results_workbook(
     for row_index, row in enumerate(rows, start=1):
         for column_index, (key, _, kind, _) in enumerate(RESULT_COLUMNS):
             value = row.get(key)
-            if value is None or (isinstance(value, float) and math.isnan(value)):
+            if _is_blank_cell(value):
                 sheet.write_blank(row_index, column_index, None, formats[kind])
             elif kind == "percent":
                 sheet.write_number(row_index, column_index, float(value) / 100, formats[kind])
